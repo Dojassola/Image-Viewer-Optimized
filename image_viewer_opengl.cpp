@@ -42,16 +42,22 @@ PFNWGLSWAPINTERVALEXTPROC wglSwapIntervalEXT = NULL;
 #ifndef GL_CLAMP_TO_EDGE
 #define GL_CLAMP_TO_EDGE 0x812F
 #endif
+#ifndef GL_BGRA_EXT
+#define GL_BGRA_EXT 0x80E1
+#endif
 
 typedef struct {
     int width;
     int height;
+    int source_width;
+    int source_height;
     int channels;
     float zoom;
     float pan_x;  
     float pan_y;
     GLuint texture_id;
     bool has_mipmaps;
+    bool scaled_to_fit_gpu;
 } Image;
 
 Image current_image = {0};
@@ -61,6 +67,9 @@ HDC hdc_gl = NULL;
 HGLRC hglrc = NULL;
 HFONT font_ui = NULL;
 GLuint font_base = 0;
+IWICImagingFactory *wic_factory = NULL;
+int max_texture_size = 4096;
+bool supports_bgra = false;
 
 static bool is_dragging = false;
 static bool tracking_mouse = false;
@@ -188,6 +197,22 @@ static void get_image_rect(float *x, float *y, float *w, float *h) {
     *y = view_y + ((float)view_h - *h) * 0.5f + current_image.pan_y;
 }
 
+static void fit_dimensions_to_limit(UINT src_w, UINT src_h, int limit, UINT *dst_w, UINT *dst_h) {
+    *dst_w = src_w;
+    *dst_h = src_h;
+    if (limit <= 0 || ((int)src_w <= limit && (int)src_h <= limit))
+        return;
+
+    double scale_x = (double)limit / (double)src_w;
+    double scale_y = (double)limit / (double)src_h;
+    double scale = scale_x < scale_y ? scale_x : scale_y;
+    if (scale <= 0.0)
+        scale = 1.0;
+
+    *dst_w = (UINT)fmax(1.0, floor((double)src_w * scale));
+    *dst_h = (UINT)fmax(1.0, floor((double)src_h * scale));
+}
+
 void free_image() {
     if (current_image.texture_id) {
         glDeleteTextures(1, &current_image.texture_id);
@@ -195,8 +220,11 @@ void free_image() {
     }
     current_image.width = 0;
     current_image.height = 0;
+    current_image.source_width = 0;
+    current_image.source_height = 0;
     current_image.channels = 0;
     current_image.has_mipmaps = false;
+    current_image.scaled_to_fit_gpu = false;
 }
 
 bool init_opengl(HWND hwnd) {
@@ -229,6 +257,9 @@ bool init_opengl(HWND hwnd) {
     glGenerateMipmap = (PFNGLGENERATEMIPMAPPROC)wglGetProcAddress("glGenerateMipmap");
     wglSwapIntervalEXT = (PFNWGLSWAPINTERVALEXTPROC)wglGetProcAddress("wglSwapIntervalEXT");
     if (wglSwapIntervalEXT) wglSwapIntervalEXT(1);
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_texture_size);
+    if (max_texture_size < 1) max_texture_size = 4096;
+    supports_bgra = has_gl_extension("GL_EXT_bgra");
     
     
     glEnable(GL_TEXTURE_2D);
@@ -276,35 +307,50 @@ void cleanup_opengl() {
 bool load_image(const wchar_t *filename) {
     free_image();
 
-    IWICImagingFactory *factory = NULL;
     IWICBitmapDecoder *decoder = NULL;
     IWICBitmapFrameDecode *frame = NULL;
+    IWICBitmapScaler *scaler = NULL;
     IWICFormatConverter *converter = NULL;
+    IWICBitmapSource *decode_source = NULL;
     unsigned char *image_data = NULL;
 
-    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
-                                  IID_PPV_ARGS(&factory));
-    if (FAILED(hr)) {
+    if (!wic_factory) {
         MessageBoxW(hwnd_main, L"Could not initialize the Windows image decoder.", L"Load Error", MB_OK | MB_ICONERROR);
         return false;
     }
 
-    hr = factory->CreateDecoderFromFilename(filename, NULL, GENERIC_READ,
-                                            WICDecodeMetadataCacheOnDemand, &decoder);
+    HRESULT hr = wic_factory->CreateDecoderFromFilename(filename, NULL, GENERIC_READ,
+                                                        WICDecodeMetadataCacheOnDemand, &decoder);
     if (SUCCEEDED(hr))
         hr = decoder->GetFrame(0, &frame);
+
+    UINT source_width = 0;
+    UINT source_height = 0;
     if (SUCCEEDED(hr))
-        hr = factory->CreateFormatConverter(&converter);
+        hr = frame->GetSize(&source_width, &source_height);
+
+    UINT width = source_width;
+    UINT height = source_height;
+    fit_dimensions_to_limit(source_width, source_height, max_texture_size, &width, &height);
+
+    if (SUCCEEDED(hr) && (width != source_width || height != source_height)) {
+        hr = wic_factory->CreateBitmapScaler(&scaler);
+        if (SUCCEEDED(hr)) {
+            hr = scaler->Initialize(frame, width, height, WICBitmapInterpolationModeFant);
+            decode_source = scaler;
+        }
+    } else if (SUCCEEDED(hr)) {
+        decode_source = frame;
+    }
+
+    if (SUCCEEDED(hr))
+        hr = wic_factory->CreateFormatConverter(&converter);
     if (SUCCEEDED(hr)) {
-        hr = converter->Initialize(frame, GUID_WICPixelFormat32bppRGBA,
+        hr = converter->Initialize(decode_source,
+                                   supports_bgra ? GUID_WICPixelFormat32bppBGRA : GUID_WICPixelFormat32bppRGBA,
                                    WICBitmapDitherTypeNone, NULL, 0.0,
                                    WICBitmapPaletteTypeCustom);
     }
-
-    UINT width = 0;
-    UINT height = 0;
-    if (SUCCEEDED(hr))
-        hr = converter->GetSize(&width, &height);
 
     if (SUCCEEDED(hr)) {
         if (width == 0 || height == 0 || width > (UINT)(INT_MAX / 4) ||
@@ -325,9 +371,9 @@ bool load_image(const wchar_t *filename) {
         hr = converter->CopyPixels(NULL, stride, image_size, image_data);
 
     if (converter) converter->Release();
+    if (scaler) scaler->Release();
     if (frame) frame->Release();
     if (decoder) decoder->Release();
-    if (factory) factory->Release();
 
     if (FAILED(hr)) {
         if (image_data) free(image_data);
@@ -337,7 +383,10 @@ bool load_image(const wchar_t *filename) {
 
     current_image.width = (int)width;
     current_image.height = (int)height;
+    current_image.source_width = (int)source_width;
+    current_image.source_height = (int)source_height;
     current_image.channels = 4;
+    current_image.scaled_to_fit_gpu = (width != source_width || height != source_height);
     current_image.zoom = 1.0f;
     current_image.pan_x = 0.0f;
     current_image.pan_y = 0.0f;
@@ -347,7 +396,7 @@ bool load_image(const wchar_t *filename) {
     glBindTexture(GL_TEXTURE_2D, current_image.texture_id);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, current_image.width, current_image.height,
-                 0, GL_RGBA, GL_UNSIGNED_BYTE, image_data);
+                 0, supports_bgra ? GL_BGRA_EXT : GL_RGBA, GL_UNSIGNED_BYTE, image_data);
     
     free(image_data);
     image_data = NULL;
@@ -428,24 +477,28 @@ void render_frame() {
 
     float img_x, img_y, img_w, img_h;
     get_image_rect(&img_x, &img_y, &img_w, &img_h);
+    bool image_visible = img_x < win_width && img_x + img_w > 0.0f &&
+                         img_y < win_height && img_y + img_h > TOOLBAR_HEIGHT;
 
     int view_height = win_height - TOOLBAR_HEIGHT;
     if (view_height < 1) view_height = 1;
 
-    glEnable(GL_SCISSOR_TEST);
-    glScissor(0, 0, win_width, view_height);
-    glEnable(GL_TEXTURE_2D);
-    glBindTexture(GL_TEXTURE_2D, current_image.texture_id);
-    glColor3f(1.0f, 1.0f, 1.0f);
-    
-    glBegin(GL_QUADS);
-        glTexCoord2f(0.0f, 0.0f); glVertex2f(img_x, img_y);
-        glTexCoord2f(1.0f, 0.0f); glVertex2f(img_x + img_w, img_y);
-        glTexCoord2f(1.0f, 1.0f); glVertex2f(img_x + img_w, img_y + img_h);
-        glTexCoord2f(0.0f, 1.0f); glVertex2f(img_x, img_y + img_h);
-    glEnd();
+    if (image_visible) {
+        glEnable(GL_SCISSOR_TEST);
+        glScissor(0, 0, win_width, view_height);
+        glEnable(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, current_image.texture_id);
+        glColor3f(1.0f, 1.0f, 1.0f);
 
-    glDisable(GL_SCISSOR_TEST);
+        glBegin(GL_QUADS);
+            glTexCoord2f(0.0f, 0.0f); glVertex2f(img_x, img_y);
+            glTexCoord2f(1.0f, 0.0f); glVertex2f(img_x + img_w, img_y);
+            glTexCoord2f(1.0f, 1.0f); glVertex2f(img_x + img_w, img_y + img_h);
+            glTexCoord2f(0.0f, 1.0f); glVertex2f(img_x, img_y + img_h);
+        glEnd();
+
+        glDisable(GL_SCISSOR_TEST);
+    }
     draw_toolbar(win_width);
     SwapBuffers(hdc_gl);
 }
@@ -456,9 +509,19 @@ void update_title() {
     SetWindowTextW(hwnd_main, title);
 
     if (current_image.texture_id) {
-        swprintf(status_text, 512, L"%dx%d  |  %.0f%%  |  %s",
-                 current_image.width, current_image.height, current_image.zoom * 100.0f,
-                 current_image.has_mipmaps ? L"mipmaps" : L"linear");
+        if (current_image.scaled_to_fit_gpu) {
+            swprintf(status_text, 512, L"%dx%d -> %dx%d  |  %.0f%%  |  %s  |  GPU max %d",
+                     current_image.source_width, current_image.source_height,
+                     current_image.width, current_image.height,
+                     current_image.zoom * 100.0f,
+                     current_image.has_mipmaps ? L"mipmaps" : L"linear",
+                     max_texture_size);
+        } else {
+            swprintf(status_text, 512, L"%dx%d  |  %.0f%%  |  %s  |  GPU max %d",
+                     current_image.width, current_image.height, current_image.zoom * 100.0f,
+                     current_image.has_mipmaps ? L"mipmaps" : L"linear",
+                     max_texture_size);
+        }
     } else {
         swprintf(status_text, 512, L"Open an image or drop one here. Mouse wheel zooms, drag pans.");
     }
@@ -691,6 +754,10 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev_instance, wchar_t *cmd_line, int show_cmd) {
     HRESULT coinit = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    if (SUCCEEDED(coinit)) {
+        CoCreateInstance(CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
+                         IID_PPV_ARGS(&wic_factory));
+    }
 
     WNDCLASSW wc = {0};
     wc.lpfnWndProc = wnd_proc;
@@ -716,6 +783,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev_instance, wchar_t *cmd_li
         DispatchMessageW(&msg);
     }
 
+    if (wic_factory) {
+        wic_factory->Release();
+        wic_factory = NULL;
+    }
     if (SUCCEEDED(coinit)) {
         CoUninitialize();
     }
