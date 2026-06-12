@@ -2,21 +2,35 @@ name: Build Windows Image Viewer
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Versão da release, por exemplo: v1.0.0"
+        required: true
+        default: "v1.0.0"
+
   push:
-    paths:
-      - "viewer.cpp"
-      - ".github/workflows/build.yml"
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-2022
+
     steps:
       - name: Download repository
         uses: actions/checkout@v4
+
       - name: Find Visual Studio
         shell: pwsh
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-          $vsPath = & $vswhere -latest -products * `
+
+          $vsPath = & $vswhere `
+            -latest `
+            -products * `
             -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
             -property installationPath
 
@@ -24,18 +38,81 @@ jobs:
             throw "Visual Studio C++ tools were not found."
           }
 
-          "VS_PATH=$vsPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "VS_PATH=$vsPath" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+
       - name: Compile
         shell: cmd
         run: |
           call "%VS_PATH%\VC\Auxiliary\Build\vcvars64.bat"
+
           cl viewer.cpp /nologo /O2 /W4 /EHsc /MT /DUNICODE /D_UNICODE ^
             /Fe:viewer.exe ^
             /link /SUBSYSTEM:WINDOWS ^
             user32.lib gdi32.lib comdlg32.lib ^
             opengl32.lib shell32.lib ole32.lib windowscodecs.lib
-      - name: Upload executable
+
+      - name: Verify executable
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "viewer.exe")) {
+            throw "viewer.exe was not generated."
+          }
+
+          Get-Item "viewer.exe" |
+            Format-List Name, Length, LastWriteTime
+
+      - name: Define release version
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $tag = "${{ inputs.version }}"
+          } else {
+            $tag = "${{ github.ref_name }}"
+          }
+
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+            throw "Release version was not defined."
+          }
+
+          "RELEASE_TAG=$tag" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Create or update GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:RELEASE_TAG
+          $title = "Image Viewer $tag"
+
+          gh release view "$tag" *> $null
+
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "Release $tag already exists. Updating executable."
+
+            gh release upload "$tag" `
+              "viewer.exe#Image Viewer Windows x64" `
+              --clobber
+          }
+          else {
+            Write-Host "Creating release $tag."
+
+            gh release create "$tag" `
+              "viewer.exe#Image Viewer Windows x64" `
+              --title "$title" `
+              --generate-notes `
+              --target "${{ github.sha }}"
+          }
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to publish GitHub Release."
+          }
+
+      - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: image-viewer-windows
           path: viewer.exe
+          if-no-files-found: error
+          retention-days: 30
