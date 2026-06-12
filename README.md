@@ -1,4 +1,4 @@
-# Image-Viewer-Optimized
+# Tiny-Image-Viewer
 
 A small Win32 image viewer rendered with OpenGL.
 
