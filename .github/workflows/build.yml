@@ -1,101 +1,41 @@
-
 name: Build Windows Image Viewer
 
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-      - master
     paths:
       - "viewer.cpp"
       - ".github/workflows/build.yml"
-
 jobs:
   build:
-    name: Build x64 executable
     runs-on: windows-2022
-
     steps:
-      - name: Checkout repository
+      - name: Download repository
         uses: actions/checkout@v4
-
-      - name: Locate Visual Studio
+      - name: Find Visual Studio
         shell: pwsh
         run: |
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
-
-          if (-not (Test-Path $vswhere)) {
-            throw "vswhere.exe was not found."
-          }
-
-          $vsPath = & $vswhere `
-            -latest `
-            -products * `
+          $vsPath = & $vswhere -latest -products * `
             -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
             -property installationPath
 
           if (-not $vsPath) {
-            throw "Visual Studio C++ build tools were not found."
+            throw "Visual Studio C++ tools were not found."
           }
 
-          "VS_PATH=$vsPath" | Out-File `
-            -FilePath $env:GITHUB_ENV `
-            -Encoding utf8 `
-            -Append
-
-      - name: Compile viewer
+          "VS_PATH=$vsPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Compile
         shell: cmd
         run: |
           call "%VS_PATH%\VC\Auxiliary\Build\vcvars64.bat"
-
-          cl viewer.cpp ^
-            /nologo ^
-            /O2 ^
-            /W4 ^
-            /EHsc ^
-            /MT ^
-            /utf-8 ^
-            /DUNICODE ^
-            /D_UNICODE ^
-            /FIcommdlg.h ^
+          cl viewer.cpp /nologo /O2 /W4 /EHsc /MT /DUNICODE /D_UNICODE ^
             /Fe:viewer.exe ^
-            /link ^
-            /SUBSYSTEM:WINDOWS ^
-            user32.lib ^
-            gdi32.lib ^
-            comdlg32.lib ^
-            opengl32.lib ^
-            shell32.lib ^
-            ole32.lib ^
-            windowscodecs.lib
-
-      - name: Verify executable
-        shell: pwsh
-        run: |
-          if (-not (Test-Path "viewer.exe")) {
-            throw "viewer.exe was not generated."
-          }
-
-          Get-Item "viewer.exe" | Format-List Name, Length, LastWriteTime
-
-      - name: Package executable
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Path "release" -Force | Out-Null
-          Copy-Item "viewer.exe" "release\viewer.exe"
-
-          Compress-Archive `
-            -Path "release\viewer.exe" `
-            -DestinationPath "image-viewer-windows-x64.zip" `
-            -Force
-
+            /link /SUBSYSTEM:WINDOWS ^
+            user32.lib gdi32.lib comdlg32.lib ^
+            opengl32.lib shell32.lib ole32.lib windowscodecs.lib
       - name: Upload executable
         uses: actions/upload-artifact@v4
         with:
-          name: image-viewer-windows-x64
-          path: |
-            viewer.exe
-            image-viewer-windows-x64.zip
-          if-no-files-found: error
-          retention-days: 30
+          name: image-viewer-windows
+          path: viewer.exe
