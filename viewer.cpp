@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <limits.h>
+#include <commdlg.h>
 
 #pragma comment(lib, "opengl32.lib")
 #pragma comment(lib, "shell32.lib")
