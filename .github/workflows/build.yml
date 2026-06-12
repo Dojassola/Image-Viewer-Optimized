@@ -1,0 +1,46 @@
+name: Build Windows Image Viewer
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "viewer.cpp"
+      - ".github/workflows/build.yml"
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Download repository
+        uses: actions/checkout@v4
+
+      - name: Find Visual Studio
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+
+          if (-not $vsPath) {
+            throw "Visual Studio C++ tools were not found."
+          }
+
+          "VS_PATH=$vsPath" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Compile
+        shell: cmd
+        run: |
+          call "%VS_PATH%\VC\Auxiliary\Build\vcvars64.bat"
+          cl viewer.cpp /nologo /O2 /W4 /EHsc /MT /DUNICODE /D_UNICODE ^
+            /Fe:viewer.exe ^
+            /link /SUBSYSTEM:WINDOWS ^
+            user32.lib gdi32.lib comdlg32.lib ^
+            opengl32.lib shell32.lib ole32.lib windowscodecs.lib
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-viewer-windows
+          path: viewer.exe
